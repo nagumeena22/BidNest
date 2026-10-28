@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { Listing, type ListingCategory, type ListingCondition } from '../models/Listing.js';
 import { AuthRequest } from '../middleware/auth.js';
 import { WantedAlert, type IWantedAlert } from '../models/WantedAlert.js';
+import { BidServiceError, closeExpiredAuction, isVerifiedBuyer, placeBidForUser, runProxyBidding } from '../services/bidService.js';
 
 const listingCategories: ListingCategory[] = ['cycle', 'calculator', 'books', 'electronics', 'hostel_essentials', 'sports', 'other'];
 const listingConditions: ListingCondition[] = ['Like New', 'Gently Used', 'Functional', 'Heavily Used'];
@@ -84,24 +85,9 @@ export const getListings = async (req: Request, res: Response): Promise<void> =>
 const isVerifiedSeller = (user: NonNullable<AuthRequest['user']>) =>
   user.role === 'seller' && user.rollNumber.startsWith('23');
 
-const closeExpiredAuction = async (listing: InstanceType<typeof Listing>): Promise<boolean> => {
-  if (listing.status !== 'ACTIVE' || new Date(listing.closingTime).getTime() > Date.now()) return false;
-  if (listing.bids.length === 0) {
-    listing.status = 'UNSOLD';
-  } else {
-    listing.status = 'PROVISIONALLY_CLOSED';
-    listing.handoverStatus = 'AWAITING_SELLER_APPROVAL';
-  }
-  await listing.save();
-  return true;
-};
-
 const closeExpiredAuctions = async (listings: InstanceType<typeof Listing>[]) => {
   for (const listing of listings) await closeExpiredAuction(listing);
 };
-
-const isVerifiedBuyer = (user: NonNullable<AuthRequest['user']>) =>
-  user.role === 'buyer' && user.rollNumber.startsWith('24');
 
 const alertMatchesListing = (alert: IWantedAlert, listing: InstanceType<typeof Listing>) => {
   const searchText = `${listing.title} ${listing.description}`.toLowerCase();
@@ -332,40 +318,6 @@ export const answerListingQuestion = async (req: AuthRequest, res: Response): Pr
     console.error('Answer Listing Question Error:', error);
     res.status(500).json({ message: error.message || 'Could not post the answer.' });
   }
-};
-
-const runProxyBidding = (listing: InstanceType<typeof Listing>) => {
-  const activeSettings = listing.proxyBids.filter((setting) => setting.active);
-  const leadingSetting = activeSettings.find((setting) => setting.bidderId === listing.leadingBidderId);
-  const candidate = activeSettings
-    .filter((setting) => setting.bidderId !== listing.leadingBidderId)
-    .sort((left, right) => right.maxAmount - left.maxAmount)[0];
-  if (!candidate) return false;
-
-  if (leadingSetting && leadingSetting.maxAmount >= candidate.maxAmount) return false;
-
-  const minimumBid = listing.bids.length === 0
-    ? listing.startingPrice
-    : listing.currentBid + listing.minIncrement;
-  if (minimumBid > candidate.maxAmount) return false;
-
-  listing.bids.push({
-    bidderId: candidate.bidderId,
-    bidderName: candidate.bidderName,
-    bidderRoll: candidate.bidderRoll,
-    amount: minimumBid,
-    timestamp: new Date(),
-  });
-  listing.currentBid = minimumBid;
-  listing.leadingBidderId = candidate.bidderId;
-  listing.leadingBidderName = candidate.bidderName;
-  listing.leadingBidderRoll = candidate.bidderRoll;
-  listing.totalBids = listing.bids.length;
-  if (new Date(listing.closingTime).getTime() - Date.now() <= 30000) {
-    listing.closingTime = new Date(Date.now() + 60000);
-    listing.isExtended = true;
-  }
-  return true;
 };
 
 // Keep auction status transitions current when buyers browse or check their bids.
@@ -909,122 +861,24 @@ export const cancelListing = async (req: AuthRequest, res: Response): Promise<vo
 export const placeBid = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = req.user;
-    const { id } = req.params;
-    const { amount } = req.body;
-
+    const listingId = req.params.id;
     if (!user) {
       res.status(401).json({ message: 'Authentication required to place a bid' });
       return;
     }
-
-    // Role check: Buyer only (Roll starts with 24)
-    if (user.role !== 'buyer' || !user.rollNumber.startsWith('24')) {
-      res.status(403).json({
-        message: `Bidding is reserved for Junior Buyers (Batch 24). Seniors (Batch 23) cannot place bids.`,
-      });
+    if (typeof listingId !== 'string') {
+      res.status(400).json({ message: 'A valid listing is required to place a bid.' });
       return;
     }
-
-    const bidAmount = Number(amount);
-    if (isNaN(bidAmount) || bidAmount <= 0) {
-      res.status(400).json({ message: 'Please enter a valid numeric bid amount' });
+    const result = await placeBidForUser(user, listingId, Number(req.body?.amount));
+    res.status(200).json({ ...result, listing: result.listing.toJSON() });
+  } catch (error: unknown) {
+    if (error instanceof BidServiceError) {
+      res.status(error.status).json({ message: error.message });
       return;
     }
-
-    const listing = await Listing.findById(id);
-    if (!listing) {
-      res.status(404).json({ message: 'Listing not found' });
-      return;
-    }
-
-    // Cannot bid on cancelled or closed listing
-    if (listing.status !== 'ACTIVE') {
-      res.status(400).json({ message: `Auction is ${listing.status.toLowerCase()}. Bids can no longer be placed.` });
-      return;
-    }
-
-    const now = Date.now();
-    const closingMs = new Date(listing.closingTime).getTime();
-
-    // Check if time has expired
-    if (now >= closingMs) {
-      await closeExpiredAuction(listing);
-      res.status(400).json({ message: 'This auction has just closed! Bidding has stopped.' });
-      return;
-    }
-
-    // Prevent seller from bidding on own item
-    if (listing.sellerId === user._id.toString()) {
-      res.status(400).json({ message: 'Sellers cannot bid on their own listings' });
-      return;
-    }
-    const ownProxyBid = listing.proxyBids.find((proxyBid) => proxyBid.bidderId === user._id.toString() && proxyBid.active);
-    if (ownProxyBid && bidAmount > ownProxyBid.maxAmount) {
-      res.status(400).json({
-        message: `Your active automatic-bid limit is ₹${ownProxyBid.maxAmount.toLocaleString()}. Raise or stop that limit before bidding higher.`,
-      });
-      return;
-    }
-
-    // Bid validation rule:
-    // First bid: >= startingPrice
-    // Subsequent bids: >= currentBid + minIncrement
-    const isFirstBid = listing.bids.length === 0;
-    const minRequiredBid = isFirstBid
-      ? listing.startingPrice
-      : listing.currentBid + listing.minIncrement;
-
-    if (bidAmount < minRequiredBid) {
-      res.status(400).json({
-        message: `Your bid of ₹${bidAmount.toLocaleString()} is too low. The minimum valid bid is ₹${minRequiredBid.toLocaleString()} (Starting/Current + Min Increment ₹${listing.minIncrement}).`,
-      });
-      return;
-    }
-
-    // ANTI-SNIPING ENGINE:
-    // If a valid bid arrives in the last 30 seconds of an auction,
-    // the closing time moves to 60 seconds after that bid!
-    let wasExtended = false;
-    const remainingMs = closingMs - now;
-    if (remainingMs <= 30000) { // <= 30 seconds
-      listing.closingTime = new Date(now + 60000); // 60 seconds from now
-      listing.isExtended = true;
-      wasExtended = true;
-      console.log(`⏱️ Anti-Sniping triggered on item ${listing.title}! Closing extended by 60s.`);
-    }
-
-    // Record bid
-    const newBid = {
-      bidderId: user._id.toString(),
-      bidderName: user.name,
-      bidderRoll: user.rollNumber,
-      amount: bidAmount,
-      timestamp: new Date(),
-    };
-
-    listing.bids.push(newBid);
-    listing.currentBid = bidAmount;
-    listing.leadingBidderId = user._id.toString();
-    listing.leadingBidderName = user.name;
-    listing.leadingBidderRoll = user.rollNumber;
-    listing.totalBids = listing.bids.length;
-
-    const automaticBidPlaced = runProxyBidding(listing);
-    await listing.save();
-
-    res.status(200).json({
-      message: automaticBidPlaced
-        ? `Your bid was accepted. An authorized automatic bid updated the leading price to ₹${listing.currentBid.toLocaleString()}.`
-        : wasExtended
-        ? `Bid of ₹${bidAmount.toLocaleString()} accepted! ⚡ Anti-Sniping triggered: Closing extended to 60 seconds.`
-        : `Your bid of ₹${bidAmount.toLocaleString()} has been placed successfully! You are now the leading bidder.`,
-      extended: wasExtended,
-      newClosingTime: listing.closingTime,
-      listing: listing.toJSON(),
-    });
-  } catch (error: any) {
     console.error('Place Bid Error:', error);
-    res.status(500).json({ message: error.message || 'Failed to place bid' });
+    res.status(500).json({ message: 'Failed to place bid.' });
   }
 };
 

@@ -37,6 +37,7 @@ const emptyListingForm = {
 
 const BuyerPortalView: React.FC = () => {
   const { currentUser, activeRole } = useAuth();
+  const [activeBuyerTab, setActiveBuyerTab] = useState<'auctions' | 'assistant'>('auctions');
   const [listings, setListings] = useState<Listing[]>([]);
   const [buyerBids, setBuyerBids] = useState<Listing[]>([]);
   const [buyerAlerts, setBuyerAlerts] = useState<{ id: string; message: string; timestamp: string }[]>([]);
@@ -478,6 +479,40 @@ const BuyerPortalView: React.FC = () => {
         <div className="absolute -right-20 -bottom-20 w-80 h-80 rounded-full bg-indigo-500/10 blur-3xl pointer-events-none"></div>
       </div>
 
+      {isBuyer && (
+        <div role="tablist" aria-label="Buyer workspace" className="flex gap-2 border-b border-slate-800">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeBuyerTab === 'auctions'}
+            aria-controls="buyer-workspace-panel"
+            onClick={() => setActiveBuyerTab('auctions')}
+            className={`rounded-t-lg px-4 py-2.5 text-sm font-semibold ${activeBuyerTab === 'auctions' ? 'border-b-2 border-indigo-400 text-white' : 'text-slate-400 hover:text-white'}`}
+          >
+            Auctions
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeBuyerTab === 'assistant'}
+            aria-controls="buyer-workspace-panel"
+            onClick={() => setActiveBuyerTab('assistant')}
+            className={`rounded-t-lg px-4 py-2.5 text-sm font-semibold ${activeBuyerTab === 'assistant' ? 'border-b-2 border-purple-400 text-white' : 'text-slate-400 hover:text-white'}`}
+          >
+            <span className="inline-flex items-center gap-2"><Bot className="h-4 w-4" />AI Assistant</span>
+          </button>
+        </div>
+      )}
+
+      {isBuyer && activeBuyerTab === 'assistant' ? (
+        <div role="tabpanel" id="buyer-workspace-panel" aria-label="AI Assistant">
+          <BuyerAssistant onOpenListing={(listingId) => {
+            setActiveBuyerTab('auctions');
+            window.setTimeout(() => document.getElementById(`listing-${listingId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0);
+          }} />
+        </div>
+      ) : (
+      <div role={isBuyer ? 'tabpanel' : undefined} id={isBuyer ? 'buyer-workspace-panel' : undefined} aria-label={isBuyer ? 'Auctions' : undefined}>
       {/* Feature Navigation & Roadmap Tabs */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-4 flex items-center gap-3">
@@ -505,8 +540,8 @@ const BuyerPortalView: React.FC = () => {
             <Bot className="w-5 h-5" />
           </div>
           <div>
-            <div className="text-xs text-slate-400">AI Concierge</div>
-            <div className="text-base font-bold text-purple-300">Smart Bidding</div>
+            <div className="text-xs text-slate-400">Groq AI Assistant</div>
+            <div className="text-base font-bold text-purple-300">Live Auction Search</div>
           </div>
         </div>
 
@@ -582,7 +617,6 @@ const BuyerPortalView: React.FC = () => {
           </label>
         </form>
 
-        {isBuyer && <BuyerAssistant listings={listings.filter((item) => item.status === 'ACTIVE')} />}
         {isBuyer && <WantedAlerts />}
 
         {isBuyer && (
@@ -923,6 +957,8 @@ const BuyerPortalView: React.FC = () => {
           BidNest System v1.0.0 &bull; Session Active
         </div>
       </div>
+      </div>
+      )}
 
     </div>
   );
